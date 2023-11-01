@@ -530,15 +530,21 @@ fn value_to_checked_expression(anon this_value: Value, anon mut interpreter: Int
             namespace_.push(reversed_namespace[i - 1])
         }
 
+        let callee = interpreter.program.get_function(constructor!)
+        if materialised_fields.size() > callee.params.size() {
+            interpreter.error_with_hint(
+                "Too many arguments for constructor", this_value.span,
+                format("Expected at most {} arguments, got {}", callee.params.size(), materialised_fields.size()), this_value.span)
+            throw Error::from_errno(InterpretError::MismatchingArguments as! i32)
+        }
+
         let name = struct_.name
         mut args: [(String, CheckedExpression)] = []
         for i in 0..materialised_fields.size() {
             let arg = materialised_fields[i]
-            let label = interpreter.program.get_variable(struct_.fields[i].variable_id).name
+            let label = callee.params[i].variable.name
             args.push((label, arg))
         }
-
-        let callee = interpreter.program.get_function(constructor!)
 
         let call = CheckedCall(
             namespace_
@@ -800,6 +806,16 @@ class InterpreterScope {
 
                 bindings.set(pair.0, pair.1)
             }
+            for mixin in scope.resolution_mixins {
+                let mixin_scope = program.get_scope(mixin)
+                for pair in mixin_scope.comptime_bindings {
+                    if bindings.contains(pair.0) {
+                        continue
+                    }
+
+                    bindings.set(pair.0, pair.1)
+                }
+            }
             current_id = scope.parent
         }
 
@@ -825,8 +841,8 @@ class InterpreterScope {
         }
 
         // How did this pass typecheck?
-        // panic(format("Could not find binding for {}", name))
-        throw Error::from_errno(InterpretError::UnknownVariable as! i32);
+        panic(format("Could not find binding for {}", name))
+        // throw Error::from_errno(InterpretError::UnknownVariable as! i32);
     }
 
     public fn set(mut this, anon name: String, anon value: Value) throws {
@@ -845,7 +861,8 @@ class InterpreterScope {
         }
 
         // How did this pass typecheck?
-        throw Error::from_errno(InterpretError::UnknownVariable as! i32);
+        panic(format("Could not find binding for {}", name))
+        // throw Error::from_errno(InterpretError::UnknownVariable as! i32);
     }
 
     public fn all_bindings(this) throws -> [String:Value] {
@@ -1714,12 +1731,7 @@ class Interpreter {
                         span: call_span
                     )
                     if not path.exists() {
-                        // FIXME: This should `return StatementResult::Throw(...)`, but we currently can't put strings in Error, so the output result looks vague and unhelpful.
-                        .error(
-                            format("Prelude function `File::{}` could not find file at path {}", prelude_function, path.to_string()),
-                            call_span
-                        )
-                        throw Error::from_errno(InterpretError::InvalidType as! i32)
+                        return StatementResult::Throw(.error_value(format("Could not find file at path {}", path.to_string()), call_span))
                     }
                     let file_struct_id = .program.find_struct_in_prelude("File")
                     let file_struct = .program.get_struct(file_struct_id)
@@ -1755,12 +1767,7 @@ class Interpreter {
                         span: call_span
                     )
                     if not path.exists() {
-                        // FIXME: This should `return StatementResult::Throw(...)`, but we currently can't put strings in Error, so the output result looks vague and unhelpful.
-                        .error(
-                            format("Prelude function `File::{}` could not find file at path {}", prelude_function, path.to_string()),
-                            call_span
-                        )
-                        throw Error::from_errno(InterpretError::InvalidType as! i32)
+                        return StatementResult::Throw(.error_value(format("Could not find file at path {}", path.to_string()), call_span))
                     }
                     let file_struct_id = .program.find_struct_in_prelude("File")
                     let file_struct = .program.get_struct(file_struct_id)
@@ -3231,6 +3238,45 @@ class Interpreter {
                         )
                         throw Error::from_errno(InterpretError::UnwrapOptionalNone as! i32)
                     }
+                    else => {
+                        panic("Invalid Optional configuration")
+                    }
+                }
+                "map" => match this_argument!.impl {
+                    OptionalSome(value) => {
+                        let mapper_value = arguments[0]
+                        guard mapper_value.impl is Function(block, params, return_type_id, checked_params) else {
+                            panic("Invalid mapper type in Optional::map")
+                        }
+                        mut scope = InterpreterScope::create()
+                        mut first = true
+                        for declared_param in checked_params {
+                            let name = declared_param.variable.name
+                            let (param_type_id, default_value) = params[name]
+                            if first {
+                                first = false
+                                scope.bindings.set(
+                                    name
+                                    value: cast_value_to_type(value, param_type_id, interpreter: this)
+                                )
+                            } else {
+                                let expr_value = .execute_expression(expr: default_value!, scope)
+                                if expr_value is JustValue(default_) {
+                                    scope.bindings.set(name, value: default_)
+                                } else {
+                                    return expr_value
+                                }
+                            }
+                        }
+
+                        let result = .execute_block(block, scope, call_span)
+                        guard result is JustValue(blk) else {
+                            return result
+                        }
+
+                        yield StatementResult::JustValue(blk)
+                    }
+                    OptionalNone => StatementResult::JustValue(this_argument!)
                     else => {
                         panic("Invalid Optional configuration")
                     }
@@ -7026,7 +7072,7 @@ class Interpreter {
             let fixed_block = .perform_final_interpretation_pass(
                 block
                 runtime_scope: scope_id
-                scope: InterpreterScope::create(parent: scope, bindings: resolved_captures)
+                scope: InterpreterScope::create(bindings: resolved_captures, parent: scope)
             )
 
             yield StatementResult::JustValue(Value(
@@ -7145,6 +7191,22 @@ class Interpreter {
         impl: ValueImpl::Bool(value)
         span
     )
+
+    public fn error_value(mut this, anon string: String, anon span: Span) throws -> Value {
+        let struct_id = .program.find_struct_in_prelude("Error")
+        let constructor = .program.find_function_in_scope(
+            parent_scope_id: .program.get_struct(struct_id).scope_id
+            function_name: "from_string_literal"
+        )!
+        return Value(
+            impl: ValueImpl::Struct(
+                fields: [.string_value(string, span)]
+                struct_id
+                constructor
+            )
+            span
+        )
+    }
 
     public fn string_type(mut this) throws -> TypeId {
         let string_struct_id = .program.find_struct_in_prelude("String")

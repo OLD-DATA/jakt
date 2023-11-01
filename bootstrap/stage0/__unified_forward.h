@@ -76,41 +76,47 @@ namespace build {
 struct Builder;
 struct ParallelExecutionPool;
 }
+namespace jakt__platform__utility {
+ErrorOr<DeprecatedString> join(JaktInternal::DynamicArray<DeprecatedString> const strings, DeprecatedString const separator);
+
+}
 namespace utility {
 struct Span;
 struct FileId;
 template<typename T>
 struct IterationDecision;
 
-ErrorOr<JaktInternal::DynamicArray<DeprecatedString>> append_to_each(JaktInternal::DynamicArray<DeprecatedString> const strings, DeprecatedString const suffix);
-
-bool is_ascii_alpha(u8 const c);
-
-bool is_whitespace(u8 const byte);
-
-bool is_ascii_digit(u8 const c);
-
 bool is_ascii_alphanumeric(u8 const c);
-
-ErrorOr<DeprecatedString> join(JaktInternal::DynamicArray<DeprecatedString> const strings, DeprecatedString const separator);
-
-ErrorOr<void> write_to_file(DeprecatedString const data, DeprecatedString const output_filename);
 
 bool is_ascii_octdigit(u8 const c);
 
-[[noreturn]] void todo(DeprecatedString const message);
+bool is_whitespace(u8 const byte);
 
-ErrorOr<DeprecatedString> escape_for_quotes(DeprecatedString const s);
+bool is_ascii_binary(u8 const c);
 
-bool is_ascii_hexdigit(u8 const c);
-
-ErrorOr<DeprecatedString> interpret_escapes(DeprecatedString const s);
+ErrorOr<DeprecatedString> join(JaktInternal::DynamicArray<DeprecatedString> const strings, DeprecatedString const separator);
 
 [[noreturn]] void panic(DeprecatedString const message);
 
+ErrorOr<DeprecatedString> to_string(JaktInternal::DynamicArray<u8> const bytes);
+
+ErrorOr<DeprecatedString> escape_for_quotes(DeprecatedString const s);
+
 ErrorOr<JaktInternal::DynamicArray<DeprecatedString>> prepend_to_each(JaktInternal::DynamicArray<DeprecatedString> const strings, DeprecatedString const prefix);
 
-bool is_ascii_binary(u8 const c);
+bool is_ascii_digit(u8 const c);
+
+bool is_ascii_hexdigit(u8 const c);
+
+ErrorOr<void> write_to_file(DeprecatedString const data, DeprecatedString const output_filename);
+
+ErrorOr<DeprecatedString> interpret_escapes(DeprecatedString const s);
+
+[[noreturn]] void todo(DeprecatedString const message);
+
+bool is_ascii_alpha(u8 const c);
+
+ErrorOr<JaktInternal::DynamicArray<DeprecatedString>> append_to_each(JaktInternal::DynamicArray<DeprecatedString> const strings, DeprecatedString const suffix);
 
 }
 namespace error {
@@ -152,8 +158,8 @@ struct EnumVariantPatternArgument;
 struct ParsedPatternDefault;
 struct ParsedExternalTraitImplementation;
 struct ParsedTrait;
-struct ParsedAttributeArgument;
 struct ParsedExternImport;
+struct ParsedAttributeArgument;
 struct CheckedQualifiers;
 struct ParsedModuleImport;
 struct ParsedVariable;
@@ -166,8 +172,8 @@ struct ParsedVarDeclTuple;
 struct ParsedAttribute;
 struct Parser;
 struct ParsedCall;
-struct ParsedNamespace;
 struct ParsedVarDecl;
+struct ParsedNamespace;
 struct ParsedName;
 struct ParsedAlias;
 struct ParsedMethod;
@@ -175,6 +181,7 @@ struct ParsedField;
 struct ParsedParameter;
 struct ParsedTypeQualifiers;
 struct ValueEnumVariant;
+struct ParsedFunctionParameters;
 struct VisibilityRestriction;
 struct ExternalName;
 
@@ -356,8 +363,7 @@ ErrorOr<DeprecatedString> read_all(DeprecatedString const filename);
 
 }
 namespace cpp_import__none {
-ErrorOr<ids::ScopeId> process_cpp_import(NonnullRefPtr<types::CheckedProgram>& program, jakt__path::Path const import_path, ids::ScopeId const scope_id, bool const is_c, JaktInternal::Dictionary<DeprecatedString,DeprecatedString> const defines);
-
+struct CppImportProcessor;
 }
 namespace typechecker {
 template <typename K,typename V>struct InternalDictionaryProduct;
@@ -371,6 +377,8 @@ struct NumericOrStringValue;
 struct FunctionMatchResult;
 
 ErrorOr<JaktInternal::Dictionary<DeprecatedString,DeprecatedString>> defines_from(JaktInternal::DynamicArray<parser::IncludeAction> const actions);
+
+ErrorOr<void> dump_scope(ids::ScopeId const scope_id, NonnullRefPtr<types::CheckedProgram> const& program, i64 const indent);
 
 }
 namespace codegen {
@@ -506,11 +514,14 @@ ErrorOr<void> install(jakt__path::Path const from, jakt__path::Path const to);
 
 ErrorOr<void> mkdir_p(jakt__path::Path const path);
 
+
 ErrorOr<DeprecatedString> usage();
 
 ErrorOr<JaktInternal::DynamicArray<jakt__path::Path>> find_with_extension(jakt__path::Path const path, DeprecatedString const extension);
 
 ErrorOr<int> compiler_main(JaktInternal::DynamicArray<DeprecatedString> const args);
+
+ErrorOr<DeprecatedString> escape_for_depfile(DeprecatedString const input);
 
 ErrorOr<DeprecatedString> help();
 

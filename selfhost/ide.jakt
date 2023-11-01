@@ -91,7 +91,7 @@ fn find_symbols_in_namespace(anon namespace_: ParsedNamespace) throws -> [JaktSy
         symbols.push_values(&find_symbols_in_namespace(sub_namespace))
     }
 
-    if not namespace_.name_span.has_value() {
+    guard namespace_.name_span.has_value() and namespace_.name.has_value() else {
         // anonymous namespaces just return the symbols contained
         return symbols
     }
@@ -966,6 +966,14 @@ fn get_function_signature(program: CheckedProgram, function_id: FunctionId) thro
 
         parameters += format("{}{}{}{}{}", separator, anon_value, is_mutable, param.variable.name, variable_type)
         is_first_param = false
+    }
+
+    if checked_function.has_varargs {
+        if is_first_param {
+            parameters += ".."
+        } else {
+            parameters += ", .."
+        }
     }
 
     let throws_str = match checked_function.can_throw {

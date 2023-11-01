@@ -23,6 +23,8 @@ set(AK_SOURCES
     NumberFormat.cpp
     OptionParser.cpp
     Random.cpp
+    SipHash.cpp
+    Slugify.cpp
     StackInfo.cpp
     Stream.cpp
     String.cpp

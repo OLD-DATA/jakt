@@ -12,6 +12,11 @@ import lexer { Token, LiteralPrefix, LiteralSuffix }
 import utility { panic, todo, FileId, Span, join }
 import compiler { Compiler }
 
+struct ParsedFunctionParameters {
+    parameters: [ParsedParameter]
+    has_varargs: bool
+}
+
 enum ExternalName {
     Plain(String)
     PreprocessorName(String)
@@ -267,6 +272,8 @@ struct ParsedNamespace {
     generating_import_extern_before_include: [IncludeAction]
     generating_import_extern_after_include: [IncludeAction]
     forall_chunks: [([ParsedGenericParameter], ParsedNamespace)]
+    is_generated_code: bool = false
+    is_auto_extern_imported: bool = false
 
     fn is_equivalent_to(this, anon other: ParsedNamespace) -> bool =>
         .name == other.name and .import_path_if_extern == other.import_path_if_extern
@@ -366,6 +373,7 @@ struct ParsedRecord {
     implements_list: [ParsedNameWithGenericParameters]?
     methods: [ParsedMethod]
     record_type: RecordType
+    nested_records: [ParsedRecord]
 
     external_name: ExternalName? = None
 }
@@ -408,6 +416,7 @@ struct ParsedFunction {
     is_comptime: bool
     is_fat_arrow: bool
     is_unsafe: bool
+    has_varargs: bool = false
 
     external_name: ExternalName? = None
     deprecated_message: String? = None // if not None, the function is deprecated
@@ -1637,7 +1646,10 @@ boxed enum ParsedType {
             else => false
         }
         Empty => rhs_parsed_type is Empty
-        Const => false // FIXME: Implement this.
+        Const(expr) => match rhs_parsed_type {
+            Const(expr: rhs_expr) => expr.equals(rhs_expr)
+            else => false
+        }
     }
 }
 
@@ -1858,10 +1870,6 @@ struct Parser {
                     saw_an_entity = true
                 }
                 Namespace => {
-                    if not active_attributes.is_empty() {
-                        .error("Cannot apply attributes to namespaces", active_attributes[0].span)
-                        active_attributes = []
-                    }
                     .index++
                     let name: (String, Span)? = match .current() {
                         Identifier(name, span) => {
@@ -1886,6 +1894,10 @@ struct Parser {
                         namespace_.name = name!.0
                         namespace_.name_span = name!.1
                     }
+
+                    .apply_attributes(&mut namespace_, &active_attributes)
+                    active_attributes = []
+
                     parsed_namespace.add_child_namespace(namespace_)
                     saw_an_entity = true
                 }
@@ -1965,6 +1977,93 @@ struct Parser {
         }
 
         return parsed_namespace
+    }
+
+    fn apply_attributes(mut this, anon namespace_: &mut ParsedNamespace, active_attributes: &[ParsedAttribute]) throws {
+        for attribute in *active_attributes {
+            match attribute.name {
+                "extern_import" => {
+                    // extern_import(from: String, {[un]define_before: String}, {[un]define_after: String})
+                    guard not attribute.assigned_value.has_value() else {
+                        .error(
+                            format("The attribute '{}' does not take a value", attribute.name)
+                            attribute.span
+                        )
+                        continue
+                    }
+
+                    for argument in attribute.arguments {
+                        match argument.name {
+                            "from" => {
+                                namespace_.import_path_if_extern = argument.assigned_value
+                            }
+                            "define_before"
+                            | "undefine_before"
+                            | "define_after"
+                            | "undefine_after" => {
+                                guard argument.assigned_value.has_value() else {
+                                    .error(
+                                        format("The argument '{}' expects a value", argument.name)
+                                        argument.span
+                                    )
+                                    continue
+                                }
+
+                                if argument.name.starts_with("define") {
+                                    let parts = argument.assigned_value!.split(c'=')
+                                    if parts.size() != 2 {
+                                        .error(
+                                            format("The argument '{}' expects a value in the form 'name=value'", argument.name)
+                                            argument.span
+                                        )
+                                        continue
+                                    }
+                                    let action = IncludeAction::Define(name: parts[0], span: attribute.span, value: parts[1])
+
+                                    if argument.name.ends_with("before") {
+                                        namespace_.generating_import_extern_before_include.push(action)
+                                    } else {
+                                        namespace_.generating_import_extern_after_include.push(action)
+                                    }
+                                } else {
+                                    let action = IncludeAction::Undefine(name: argument.assigned_value!, span: attribute.span)
+
+                                    if argument.name.ends_with("before") {
+                                        namespace_.generating_import_extern_before_include.push(action)
+                                    } else {
+                                        namespace_.generating_import_extern_after_include.push(action)
+                                    }
+                                }
+                            }
+                            else => {
+                                .error(
+                                    format("Invalid argument for attribute '{}'", attribute.name)
+                                    argument.span
+                                )
+                            }
+                        }
+                    }
+                }
+                "generated" => {
+                    // generated
+                    guard not attribute.assigned_value.has_value() else {
+                        .error(
+                            format("The attribute '{}' does not take a value", attribute.name)
+                            attribute.span
+                        )
+                        continue
+                    }
+
+                    namespace_.is_generated_code = true
+                }
+                else => {
+                    .error(
+                        format("The attribute '{}' does not apply to namespaces", attribute.name)
+                        attribute.span
+                    )
+                }
+            }
+        }
     }
 
     fn apply_attributes(mut this, anon field: &mut ParsedField, active_attributes: &[ParsedAttribute]) throws {
@@ -2419,11 +2518,15 @@ struct Parser {
             return ParsedExternalTraitImplementation(for_type: type_name, traits: trait_list!, methods: [])
         }
 
-        let (fields, methods) = .parse_struct_class_body(
+        let (fields, methods, records) = .parse_struct_class_body(
             definition_linkage: DefinitionLinkage::Internal
             default_visibility: Visibility::Public
             is_class: false
         )
+
+        if not records.is_empty() {
+            .error("External trait implementations cannot have nested records", records[0].name_span)
+        }
 
         if not fields.is_empty() {
             .error("External trait implementations cannot have fields", fields[0].var_decl.span)
@@ -2548,6 +2651,7 @@ struct Parser {
                 implements_list: None,
                 methods: [],
                 record_type: RecordType::Garbage
+                nested_records: []
             )
         }
     }
@@ -2634,14 +2738,15 @@ struct Parser {
                 .error("Expected '}' to end namespace for the extern import"
                         .current().span())
             }
-
-            parent.add_child_namespace(parsed_import.assigned_namespace)
         } else {
             parsed_import.should_auto_import = true
             parsed_import.assigned_namespace.import_path_if_extern = Some(import_path)
             parsed_import.assigned_namespace.generating_import_extern_before_include = parsed_import.before_include
             parsed_import.assigned_namespace.generating_import_extern_after_include = parsed_import.after_include
+            parsed_import.assigned_namespace.is_auto_extern_imported = true
         }
+
+        parent.add_child_namespace(parsed_import.assigned_namespace)
 
         loop {
             if .current() is Identifier(name) {
@@ -3011,10 +3116,16 @@ struct Parser {
         return (variants, methods)
     }
 
-    fn parse_sum_enum_body(mut this, partial_enum: ParsedRecord, definition_linkage: DefinitionLinkage, is_boxed: bool) throws -> ([SumEnumVariant], [ParsedField], [ParsedMethod]) {
+    fn parse_sum_enum_body(
+        mut this
+        partial_enum: ParsedRecord
+        definition_linkage: DefinitionLinkage
+        is_boxed: bool
+    ) throws -> ([SumEnumVariant], [ParsedField], [ParsedMethod], [ParsedRecord]) {
         mut methods: [ParsedMethod] = []
         mut variants: [SumEnumVariant] = []
         mut fields: [ParsedField] = []
+        mut records: [ParsedRecord] = []
         mut seen_a_variant = false
 
         if .current() is LCurly {
@@ -3027,14 +3138,33 @@ struct Parser {
 
         if .eof() {
             .error("Incomplete enum definition, expected variant or field name", .previous().span())
-            return (variants, fields, methods)
+            return (variants, fields, methods, records)
         }
 
         mut last_visibility: Visibility? = None
         mut last_visibility_span: Span? = None
+        mut last_extern = false
+        mut active_attributes: [ParsedAttribute] = []
+
         while not .eof() {
             match .current() {
+                Extern => {
+                    if last_extern {
+                        .error("Multiple extern modifiers are not allowed", .current().span())
+                    }
+                    last_extern = true
+                    .index++
+                }
                 Identifier(name, span) => {
+                    if last_extern {
+                        .error("An enum variant or common field cannot be extern", span)
+                        last_extern = false
+                    }
+                    if not active_attributes.is_empty() {
+                        .error("An enum variant or common field cannot have attributes", span)
+                        active_attributes = []
+                    }
+
                     if .peek(1) is Colon {
                         let field = .parse_field(visibility: last_visibility ?? Visibility::Public)
                         if seen_a_variant {
@@ -3126,6 +3256,15 @@ struct Parser {
                 Comma | Eol => {
                     .index++
                 }
+                LSquare => {
+                    if .peek(1) is LSquare {
+                        .index += 2
+                        .parse_attribute_list(&mut active_attributes)
+                    } else {
+                        .error("Unexpected token (expected ‘[[’)", .current().span())
+                        .index += 1
+                    }
+                }
                 Private(span) => {
                     if last_visibility.has_value() {
                         .error_with_hint("Multiple visibility modifiers on one field or method are not allowed", span, "Previous modifier is here", last_visibility_span!)
@@ -3145,9 +3284,12 @@ struct Parser {
                 Fn | Comptime => {
                     let is_comptime = .current() is Comptime
 
-                    let function_linkage = match definition_linkage {
-                        Internal => FunctionLinkage::Internal
-                        External => FunctionLinkage::External
+                    let function_linkage = match last_extern {
+                        true => FunctionLinkage::External
+                        false => match definition_linkage {
+                            Internal => FunctionLinkage::Internal
+                            External => FunctionLinkage::External
+                        }
                     }
 
                     if function_linkage is External and is_comptime {
@@ -3158,7 +3300,7 @@ struct Parser {
                     last_visibility = None
                     last_visibility_span = None
 
-                    let parsed_method = .parse_method(
+                    mut parsed_method = .parse_method(
                         function_linkage
                         visibility
                         is_virtual: false
@@ -3168,7 +3310,23 @@ struct Parser {
                         is_unsafe: false // FIXME: Parse unsafe methods.
                     )
 
+                    .apply_attributes(&mut parsed_method, &active_attributes)
+                    active_attributes = []
+
                     methods.push(parsed_method)
+                }
+                Struct | Enum | Boxed | Class => {
+                    if last_visibility.has_value() {
+                        .error("Nested types cannot have visibility modifiers", .current().span())
+                        last_visibility = None
+                    }
+
+                    mut parsed_record = .parse_record(
+                        match last_extern { true => DefinitionLinkage::External, false => definition_linkage }
+                    )
+                    .apply_attributes(&mut parsed_record, &active_attributes)
+                    active_attributes = []
+                    records.push(parsed_record)
                 }
                 else => {
                     .error("Expected identifier or the end of enum block", .current().span())
@@ -3179,14 +3337,14 @@ struct Parser {
 
         if not .current() is RCurly {
             .error("Invalid enum definition, expected `}`", .current().span())
-            return (variants, fields, methods)
+            return (variants, fields, methods, records)
         }
         .index++
 
         if variants.is_empty() {
             .error("Empty enums are not allowed", partial_enum.name_span)
         }
-        return (variants, fields, methods)
+        return (variants, fields, methods, records)
     }
 
     fn parse_enum(mut this, anon definition_linkage: DefinitionLinkage, is_boxed: bool) throws -> ParsedRecord {
@@ -3198,6 +3356,7 @@ struct Parser {
             implements_list: None,
             methods: [],
             record_type: RecordType::Garbage
+            nested_records: []
         )
         mut underlying_type: ParsedType? = None
         if .current() is Enum {
@@ -3262,13 +3421,18 @@ struct Parser {
                 variants
             )
         } else {
-            let (variants, fields, methods) = .parse_sum_enum_body(partial_enum: parsed_enum, definition_linkage, is_boxed)
+            let (variants, fields, methods, records) = .parse_sum_enum_body(
+                partial_enum: parsed_enum
+                definition_linkage
+                is_boxed
+            )
             parsed_enum.methods = methods
             parsed_enum.record_type = RecordType::SumEnum(
                 is_boxed: is_boxed,
                 fields,
                 variants
             )
+            parsed_enum.nested_records = records
         }
 
         return parsed_enum
@@ -3279,7 +3443,7 @@ struct Parser {
         definition_linkage: DefinitionLinkage
         default_visibility: Visibility
         is_class: bool
-    ) throws -> ([ParsedField], [ParsedMethod]) {
+    ) throws -> ([ParsedField], [ParsedMethod], [ParsedRecord]) {
         if .current() is LCurly {
             .index++
         } else {
@@ -3288,6 +3452,7 @@ struct Parser {
 
         mut fields: [ParsedField] = []
         mut methods: [ParsedMethod] = []
+        mut records: [ParsedRecord] = []
 
         // This gets reset after each loop. If someone doesn't consume it, we error out.
         mut last_visibility: Visibility? = None
@@ -3313,7 +3478,7 @@ struct Parser {
                         .error("Expected function after attribute", token.span())
                     }
                     .index++
-                    return (fields, methods)
+                    return (fields, methods, records)
                 }
                 Comma | Eol => {
                     // Treat comma as whitespace? Might require them in the future
@@ -3427,6 +3592,24 @@ struct Parser {
                     last_override = true
                     .index++
                 }
+                Struct | Enum | Boxed | Class => {
+                    if last_virtual or last_override {
+                        .error("Nested types cannot be ‘virtual’ or ‘override’", .current().span())
+                        last_virtual = false
+                        last_override = false
+                    }
+                    if last_visibility.has_value() {
+                        .error("Nested types cannot have visibility modifiers", .current().span())
+                        last_visibility = None
+                    }
+
+                    mut parsed_record = .parse_record(
+                        match last_extern { true => DefinitionLinkage::External, false => definition_linkage }
+                    )
+                    .apply_attributes(&mut parsed_record, &active_attributes)
+                    active_attributes = []
+                    records.push(parsed_record)
+                }
                 else => {
                     active_attributes = []
 
@@ -3445,7 +3628,7 @@ struct Parser {
         } else {
             .error("Incomplete struct body, expected ‘}’", .current().span())
         }
-        return (fields, methods)
+        return (fields, methods, records)
     }
 
     public fn parse_struct(mut this, anon definition_linkage: DefinitionLinkage) throws -> ParsedRecord {
@@ -3457,6 +3640,7 @@ struct Parser {
             implements_list: None,
             methods: [],
             record_type: RecordType::Garbage
+            nested_records: []
         )
         if .current() is Struct {
             .index++
@@ -3506,10 +3690,11 @@ struct Parser {
             return parsed_struct
         }
 
-        let (fields, methods) = .parse_struct_class_body(definition_linkage, default_visibility: Visibility::Public, is_class: false)
+        let (fields, methods, records) = .parse_struct_class_body(definition_linkage, default_visibility: Visibility::Public, is_class: false)
 
         parsed_struct.methods = methods
         parsed_struct.record_type = RecordType::Struct(fields, super_type)
+        parsed_struct.nested_records = records
 
         return parsed_struct
     }
@@ -3523,6 +3708,7 @@ struct Parser {
             implements_list: None,
             methods: [],
             record_type: RecordType::Garbage
+            nested_records: []
         )
         mut super_type: ParsedType? = None
         if .current() is Class {
@@ -3577,24 +3763,30 @@ struct Parser {
             return parsed_class
         }
 
-        let (fields, methods) = .parse_struct_class_body(definition_linkage, default_visibility: Visibility::Private, is_class: true)
+        let (fields, methods, records) = .parse_struct_class_body(definition_linkage, default_visibility: Visibility::Private, is_class: true)
 
         parsed_class.methods = methods
         parsed_class.record_type = RecordType::Class(fields, super_type)
+        parsed_class.nested_records = records
 
         return parsed_class
     }
 
-    public fn parse_function_parameters(mut this) throws -> [ParsedParameter] {
-        if .current() is LParen {
+    public fn parse_function_parameters(mut this, for_trailing_closure: bool = false) throws -> ParsedFunctionParameters {
+        if not for_trailing_closure and .current() is LParen {
+            .index++
+        } else if for_trailing_closure and .current() is Pipe {
             .index++
         } else {
-            .error("Expected '('", .current().span())
+            .error(
+                format("Expected '{:c}'", match for_trailing_closure { true => '|', false => ')' })
+                .current().span()
+            )
         }
 
         .skip_newlines()
 
-        mut params: [ParsedParameter] = []
+        mut result = ParsedFunctionParameters(parameters: [], has_varargs: false)
         mut current_param_requires_label = true
         mut current_param_is_mutable = false
 
@@ -3605,8 +3797,26 @@ struct Parser {
         while not .eof() {
             match .current() {
                 RParen => {
+                    if not for_trailing_closure {
+                        .index++
+                        break
+                    }
+                    if not error {
+                        .error("Expected parameter", .current().span())
+                        error = true
+                    }
                     .index++
-                    break
+                }
+                Pipe => {
+                    if for_trailing_closure {
+                        .index++
+                        break
+                    }
+                    if not error {
+                        .error("Expected parameter", .current().span())
+                        error = true
+                    }
+                    .index++
                 }
                 Comma | Eol => {
                     if not parameter_complete and not error {
@@ -3618,7 +3828,31 @@ struct Parser {
                     current_param_is_mutable = false
                     parameter_complete = false
                 }
+                DotDot => {
+                    if result.has_varargs {
+                        .error("Multiple varargs cannot be present in one parameter list", .current().span())
+                        error = true
+                    }
+                    if current_param_is_mutable {
+                        .error("A variadic argument cannot be mutable", .current().span())
+                        error = true
+                    }
+                    if not current_param_requires_label {
+                        .error("A variadic argument cannot be anonymous", .current().span())
+                        error = true
+                    }
+                    result.has_varargs = true
+                    .index++
+
+                    parameter_complete = false
+                    current_param_requires_label = true
+                    current_param_is_mutable = false
+                }
                 Anon => {
+                    if result.has_varargs {
+                        .error("A variadic argument may only appear at the end of a parameter list", .current().span())
+                        error = true
+                    }
                     if parameter_complete and not error  {
                         .error("‘anon’ must appear at start of parameter declaration, not the end", .current().span())
                         error = true
@@ -3635,6 +3869,10 @@ struct Parser {
                     current_param_requires_label = false
                 }
                 Mut => {
+                    if result.has_varargs {
+                        .error("A variadic argument may only appear at the end of a parameter list", .current().span())
+                        error = true
+                    }
                     if parameter_complete and not error  {
                         .error("‘mut’ must appear at start of parameter declaration, not the end", .current().span())
                         error = true
@@ -3647,7 +3885,11 @@ struct Parser {
                     current_param_is_mutable = true
                 }
                 This => {
-                    params.push(ParsedParameter(
+                    if result.has_varargs {
+                        .error("A variadic argument may only appear at the end of a parameter list", .current().span())
+                        error = true
+                    }
+                    result.parameters.push(ParsedParameter(
                         requires_label: false,
                         variable: ParsedVariable(
                             name: "this",
@@ -3662,6 +3904,10 @@ struct Parser {
                     parameter_complete = true
                 }
                 Identifier(name, span) => {
+                    if result.has_varargs {
+                        .error("A variadic argument may only appear at the end of a parameter list", .current().span())
+                        error = true
+                    }
                     let var_decl = .parse_variable_declaration(is_mutable: current_param_is_mutable)
 
                     mut default_argument: ParsedExpression? = None
@@ -3671,7 +3917,7 @@ struct Parser {
                         default_argument = .parse_expression(allow_assignments: false, allow_newlines: true)
                     }
 
-                    params.push(ParsedParameter(
+                    result.parameters.push(ParsedParameter(
                         requires_label: current_param_requires_label,
                         variable: ParsedVariable(
                             name: var_decl.name,
@@ -3695,7 +3941,7 @@ struct Parser {
                 }
             }
         }
-        return params
+        return result
     }
 
     public fn parse_function(
@@ -3774,7 +4020,9 @@ struct Parser {
         }
 
         if not is_destructor {
-            parsed_function.params = .parse_function_parameters()
+            let fn_parameters = .parse_function_parameters()
+            parsed_function.params = fn_parameters.parameters
+            parsed_function.has_varargs = fn_parameters.has_varargs
         }
 
         // NOTE: main() always throws
@@ -3943,19 +4191,21 @@ struct Parser {
         mut is_reference = false
         mut is_mutable_reference = false
 
-        if .current() is Identifier(name) and name == "const" {
-            qualifiers.is_immutable = true
-            .index++
-        } else if .current() is Mut {
-            qualifiers.is_mutable = true
-            .index++
-        } else if .current() is Ampersand {
+        if .current() is Ampersand {
             is_reference = true
             .index++
             if .current() is Mut {
                 is_mutable_reference = true
                 .index++
             }
+        }
+
+        if .current() is Identifier(name) and name == "const" {
+            qualifiers.is_immutable = true
+            .index++
+        } else if .current() is Mut {
+            qualifiers.is_mutable = true
+            .index++
         }
 
         mut parsed_type = .parse_type_shorthand(qualifiers)
@@ -4051,7 +4301,10 @@ struct Parser {
             let start = .current().span()
             .index++
 
-            let params = .parse_function_parameters()
+            let fn_parameters = .parse_function_parameters()
+            if fn_parameters.has_varargs {
+                .error("Function type cannot have variadic arguments", .current().span())
+            }
 
             let can_throw = .current() is Throws
             if can_throw {
@@ -4066,7 +4319,13 @@ struct Parser {
                 .error("Expected '->'", .current().span())
             }
 
-            yield ParsedType::Function(qualifiers, params, can_throw, return_type, span: merge_spans(start, return_type.span()))
+            yield ParsedType::Function(
+                qualifiers
+                params: fn_parameters.parameters
+                can_throw
+                return_type
+                span: merge_spans(start, return_type.span())
+            )
         }
         else => {
             .error("Expected type name", .current().span())
@@ -5142,10 +5401,14 @@ struct Parser {
         let start = .current().span()
         .index++
         let captures = .parse_captures()
-        let params = .parse_function_parameters()
+        let fn_parameters = .parse_function_parameters()
         let can_throw = .current() is Throws
         if can_throw {
             .index++
+        }
+
+        if fn_parameters.has_varargs {
+            .error("Anonymous functions cannot have varargs", .current().span())
         }
 
         mut return_type = match .current() {
@@ -5170,7 +5433,7 @@ struct Parser {
 
         return ParsedExpression::Function(
             captures
-            params
+            params: fn_parameters.parameters
             can_throw
             is_fat_arrow
             return_type
@@ -5966,12 +6229,49 @@ struct Parser {
 
         // Look for a possible trailing closure. For now, this has to be a block with no parameters, which captures everything by reference.
         // FIXME: Support explicit captures, and maybe parameters.
-        if .can_have_trailing_closure and .current() is LCurly {
+        if .can_have_trailing_closure {
             let start = .current().span()
-            let block = .parse_block()
+            let start_index = .index
+
+            mut block: ParsedBlock? = None
+            mut params: [ParsedParameter] = []
+            mut has_varargs = false
+            mut errors_before = .compiler.errors.size()
+
+            match .current() {
+                LCurly => {}
+                Pipe => {
+                    let parameters = .parse_function_parameters(for_trailing_closure: true)
+                    params = parameters.parameters
+                    has_varargs = parameters.has_varargs
+                }
+                else => {
+                    return call
+                }
+            }
+
+            guard .current() is LCurly else {
+                .index = start_index
+                .compiler.errors = .compiler.errors[..errors_before].to_array()
+                return call
+            }
+
+            if has_varargs {
+                .error("Function expressions cannot have varargs", .current().span())
+            }
+
+            block = .parse_block()
             let span = merge_spans(start, .current().span())
             let captures = [ParsedCapture::AllByReference(name: "", span: .empty_span())]
-            let trailing_closure = ParsedExpression::Function(captures, params: [], can_throw: false, is_fat_arrow: false, return_type: ParsedType::Empty, block, span)
+            let trailing_closure = ParsedExpression::Function(
+                captures
+                params
+                can_throw: false
+                is_fat_arrow: false
+                return_type: ParsedType::Empty
+                block: block!
+                span
+            )
             let reference_to_closure = ParsedExpression::UnaryOp(expr: trailing_closure, op: UnaryOperator::Reference, span)
             call.args.push(("", .empty_span(), reference_to_closure))
         }

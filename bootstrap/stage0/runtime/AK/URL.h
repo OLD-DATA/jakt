@@ -104,10 +104,14 @@ public:
     void append_slash()
     {
         // NOTE: To indicate that we want to end the path with a slash, we have to append an empty path segment.
-        m_paths.append("");
+        m_paths.append(String {});
     }
 
-    DeprecatedString serialize_path() const;
+    enum class ApplyPercentDecoding {
+        Yes,
+        No
+    };
+    DeprecatedString serialize_path(ApplyPercentDecoding = ApplyPercentDecoding::Yes) const;
     DeprecatedString serialize(ExcludeFragment = ExcludeFragment::No) const;
     DeprecatedString serialize_for_display() const;
     DeprecatedString to_deprecated_string() const { return serialize(); }
@@ -173,7 +177,7 @@ private:
 
     // A URL’s path is either a URL path segment or a list of zero or more URL path segments, usually identifying a location. It is initially « ».
     // A URL path segment is an ASCII string. It commonly refers to a directory or a file, but has no predefined meaning.
-    Vector<DeprecatedString> m_paths;
+    Vector<String> m_paths;
 
     // A URL’s query is either null or an ASCII string. It is initially null.
     Optional<String> m_query;

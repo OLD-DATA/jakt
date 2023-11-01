@@ -238,15 +238,16 @@ public:
         SignMode sign_mode = SignMode::OnlyIfNeeded,
         RealNumberDisplayMode = RealNumberDisplayMode::Default);
 
-    ErrorOr<void> put_f64(
-        double value,
+    template<OneOf<f32, f64> T>
+    ErrorOr<void> put_f32_or_f64(
+        T value,
         u8 base = 10,
         bool upper_case = false,
         bool zero_pad = false,
         bool use_separator = false,
         Align align = Align::Right,
         size_t min_width = 0,
-        size_t precision = 6,
+        Optional<size_t> precision = {},
         char fill = ' ',
         SignMode sign_mode = SignMode::OnlyIfNeeded,
         RealNumberDisplayMode = RealNumberDisplayMode::Default);
@@ -265,6 +266,21 @@ public:
 
 private:
     StringBuilder& m_builder;
+
+#ifndef KERNEL
+    ErrorOr<void> put_f64_with_precision(
+        double value,
+        u8 base,
+        bool upper_case,
+        bool zero_pad,
+        bool use_separator,
+        Align align,
+        size_t min_width,
+        size_t precision,
+        char fill,
+        SignMode sign_mode,
+        RealNumberDisplayMode);
+#endif
 };
 
 class TypeErasedFormatParams {
@@ -557,7 +573,7 @@ struct Formatter<nullptr_t> : Formatter<FlatPtr> {
 
 ErrorOr<void> vformat(StringBuilder&, StringView fmtstr, TypeErasedFormatParams&);
 
-#ifndef KERNEL
+#if !defined(KERNEL)
 void vout(FILE*, StringView fmtstr, TypeErasedFormatParams&, bool newline = false);
 
 template<typename... Parameters>
@@ -576,19 +592,17 @@ void outln(FILE* file, CheckedFormatString<Parameters...>&& fmtstr, Parameters c
 
 inline void outln(FILE* file) { fputc('\n', file); }
 
+#    ifndef AK_OS_ANDROID
 template<typename... Parameters>
-void out(CheckedFormatString<Parameters...>&& fmtstr, Parameters const&... parameters) { out(stdout, move(fmtstr), parameters...); }
+void out(CheckedFormatString<Parameters...>&& fmtstr, Parameters const&... parameters)
+{
+    out(stdout, move(fmtstr), parameters...);
+}
 
 template<typename... Parameters>
 void outln(CheckedFormatString<Parameters...>&& fmtstr, Parameters const&... parameters) { outln(stdout, move(fmtstr), parameters...); }
 
 inline void outln() { outln(stdout); }
-
-#    define outln_if(flag, fmt, ...)       \
-        do {                               \
-            if constexpr (flag)            \
-                outln(fmt, ##__VA_ARGS__); \
-        } while (0)
 
 template<typename... Parameters>
 void warn(CheckedFormatString<Parameters...>&& fmtstr, Parameters const&... parameters)
@@ -600,6 +614,55 @@ template<typename... Parameters>
 void warnln(CheckedFormatString<Parameters...>&& fmtstr, Parameters const&... parameters) { outln(stderr, move(fmtstr), parameters...); }
 
 inline void warnln() { outln(stderr); }
+#    else  // v Android ^ No Android
+enum class LogLevel {
+    Debug,
+    Info,
+    Warning,
+};
+
+void vout(LogLevel, StringView fmtstr, TypeErasedFormatParams&, bool newline = false);
+
+template<typename... Parameters>
+void out(CheckedFormatString<Parameters...>&& fmtstr, Parameters const&... parameters)
+{
+    VariadicFormatParams<AllowDebugOnlyFormatters::Yes, Parameters...> variadic_format_params { parameters... };
+    vout(LogLevel::Info, fmtstr.view(), variadic_format_params);
+}
+
+template<typename... Parameters>
+void outln(CheckedFormatString<Parameters...>&& fmtstr, Parameters const&... parameters)
+{
+    VariadicFormatParams<AllowDebugOnlyFormatters::Yes, Parameters...> variadic_format_params { parameters... };
+    vout(LogLevel::Info, fmtstr.view(), variadic_format_params, true);
+}
+
+inline void outln() { outln(""); }
+
+template<typename... Parameters>
+void warn(CheckedFormatString<Parameters...>&& fmtstr, Parameters const&... parameters)
+{
+    VariadicFormatParams<AllowDebugOnlyFormatters::Yes, Parameters...> variadic_format_params { parameters... };
+    vout(LogLevel::Warning, fmtstr.view(), variadic_format_params);
+}
+
+template<typename... Parameters>
+void warnln(CheckedFormatString<Parameters...>&& fmtstr, Parameters const&... parameters)
+{
+    VariadicFormatParams<AllowDebugOnlyFormatters::Yes, Parameters...> variadic_format_params { parameters... };
+    vout(LogLevel::Warning, fmtstr.view(), variadic_format_params, true);
+}
+
+inline void warnln() { warnln(""); }
+
+void set_log_tag_name(char const*);
+#    endif // AK_OS_ANDROID
+
+#    define outln_if(flag, fmt, ...)       \
+        do {                               \
+            if constexpr (flag)            \
+                outln(fmt, ##__VA_ARGS__); \
+        } while (0)
 
 #    define warnln_if(flag, fmt, ...)       \
         do {                                \
